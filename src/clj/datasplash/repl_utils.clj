@@ -6,6 +6,12 @@
    [clojure.edn :as edn]
    [superstring.core :as str]))
 
+(defn remove-0s [s]
+  (str/chop-suffix s "-00000-of-00001"))
+
+(defn add0s [s]
+  (str s " 00000-of-00001"))
+
 (defn read-edns-file
   "Reads a newline-separated seq of edn from `file`.
   Realizes it (not lazy).
@@ -18,7 +24,7 @@
 
 (defn write-map-edn
   "Uses `write-edn-file` to write individual pcolls in pcoll-map.
-  pcoll-map should be a map of pcolls. keys will be turned to
+  pcoll-map should be a map of pcolls. Keys will be turned to
   strings by `key->str`, which defaults to `name`, and they will
   be used for the filenames."
   ([dir pcoll-map]
@@ -41,14 +47,53 @@
                        (read-edns-file f)])))
          (.listFiles (java.io.File. dir)))))
 
-(defn remove-0s [s]
-  (str/chop-suffix s "-00000-of-00001"))
 
-(defn add0s [s]
-  (str s " 00000-of-00001"))
+(defn write-one [pcoll dir]
+  (ds/write-edn-file (str dir "/o") {:num-shards 1} pcoll))
 
-(.isFile (java.io.File. "/home/marc"))
-(read-map-edn "/home/marc/wme" remove-0s)
+(defn read-one [dir]
+  (read-edns-file (str dir "/o-00000-of-00001")))
+
+(defprotocol DirectRW
+  "Used internally by `direct`."
+  (dwrite [this dir])
+  (dread [this dir]))
+
+(extend-protocol DirectRW
+  org.apache.beam.sdk.values.PCollection
+  (dwrite [this dir]
+    (write-one this dir))
+  (dread [_ dir]
+    (read-one dir))
+  org.apache.beam.sdk.values.PCollectionViews$SimplePCollectionView
+  (dwrite [this dir]
+    (-> (.getPCollection this)
+        (write-one dir)))
+  (dread [_ dir]
+    ;; note : it's up to the user to add something like `first` or (into {})
+    ;; according to the type of view. It is not really possible to do it automatically
+    (read-one dir))
+  clojure.lang.PersistentArrayMap
+  (dwrite [this dir]
+    (write-map-edn dir this))
+  (dread [_ dir]
+    (read-map-edn dir remove-0s))
+  clojure.lang.PersistentVector
+  (dwrite [this dir]
+    (doseq [i (range (count this))]
+      (ds/write-edn-file (str dir "/" i) {:num-shards 1} (this i))))
+  (dread [this dir]
+    (mapv #(read-edns-file (str dir "/" % "-00000-of-00001"))
+          (range (count this)))))
+
+
+
+(let [p (ds/make-pipeline [])
+      pcoll (->> (ds/generate-input [1 2] p)
+                 (ds/map-kv (fn [x] [x (inc x)]))
+                 (ds/view {:type :map}))]
+  (ds/wait-pipeline-result (ds/run-pipeline pcoll))
+  (.getViewFn pcoll))
 
 (defmacro direct
   "Inserts pipeline boilerplate.
@@ -80,13 +125,11 @@
   written to a temp file, then the pipeline is ran (blockingly),
   then the file is read and the contents returned.
 
-  If your last form yields a PCollectionView, use the
-  special `:is-view` keyword to indicate it, because
-  we can't `ds/write-edn-file` a view, so we'll first
+  If your last form yields a PCollectionView, we'll first
   go back to the underlying pcoll.
 
-  WIP : make it work in the cases were your final form
-  yields a map or tuple of pcolls.
+  If it is a map, or a vec of pcolls, we will also take care of that
+  automatically.
 
   We do not care to remove the temp file afterwards,
   since it is the point of os-supplied temp files that
@@ -151,6 +194,7 @@
                          (filter #(= 'side-inputs (first %)))
                          first
                          second)
+        ;;TODO remove next 2 lines
         special-end (#{:is-map :is-view :is-tuple} (last forms))
         forms (if special-end (butlast forms) forms)
         forms (cond->> forms
@@ -186,77 +230,20 @@
                                           (list 'merge 'side-inputs old-si-form)))))
                             ensured-opts-map))
                      :else form))))
-        body (concat `(->> ~p-gen ~@forms) (when (= special-end :is-view)
-                                             '(.getPCollection)))
-        writing (case special-end
-                  :is-map
-                  `(write-map-edn ~tmp-dir ~user-pipeline)
-                  :is-tuple _TODO
-                  `(ds/write-edn-file (str ~tmp-dir "/o")
-                                      {:num-shards 1}
-                                      ~user-pipeline))
 
-        reading (case special-end
-                  :is-map
-                  `(read-map-edn ~tmp-dir remove-0s)
+        body `(->> ~p-gen ~@forms)]
 
-                  `(read-edns-file (str ~tmp-dir "/o-00000-of-00001")))
-
-        ]
-    `(let [~tmp-dir (java.nio.file.Files/createTempDirectory nil (make-array java.nio.file.attribute.FileAttribute 0))
+    `(let [~tmp-dir (str (java.nio.file.Files/createTempDirectory
+                          nil
+                          (make-array java.nio.file.attribute.FileAttribute 0)))
            ~p-gen (ds/make-pipeline [])
            ~@binding-vec
-           ~user-pipeline ~body
+           ~user-pipeline ~body]
 
-           ]
-       ~writing
+       (dwrite ~user-pipeline ~tmp-dir)
+
        (clojure.test/is (= :done
                            (ds/wait-pipeline-result
                             (ds/run-pipeline ~p-gen))))
-       ~reading)))
 
-(comment
-  (direct []
-    (ds/generate-input [1 2 3])
-    (ds/map inc))
-
-  (direct []
-    (ds/generate-input [1])
-    (ds/view)
-    :is-view)
-
-  (direct [a 2]
-    (ds/generate-input [1 2 3])
-    (ds/map (partial + a)))
-
-  (direct [a-view (->> (ds/generate-input [2] p)
-                       ds/view)
-           side-inputs {:a a-view}]
-    (ds/generate-input [1 2 3])
-    ;; for some reason you can't use partial...
-    (ds/map (fn [x] (+ x a))))
-
-  (direct [a-view (->> (ds/generate-input [2] p)
-                       ds/view)
-           side-inputs {:a a-view}]
-    (ds/generate-input [1 2 3])
-    (ds/map (fn [x] (+ a x))
-            {:name :opt-map-already-present}))
-
-  (direct [a-view (->> (ds/generate-input [2] p)
-                       ds/view)
-           b-view (->> (ds/generate-input [4] p)
-                       ds/view)
-           side-inputs {:a a-view}]
-    (ds/generate-input [1 2 3])
-    (ds/map (fn [x] (+ a x))
-            {:name :opt-map-already-present
-             :side-inputs {:b b-view}})))
-
-
-(comment ;; wip
-
-  (let [{:keys [leaf-nodes ancestor-nodes]}]
-   (direct [in tree]
-     (eiffel.utils/slice-tree-nodes :categories)
-     :is-map)))
+       (dread ~user-pipeline ~tmp-dir))))
