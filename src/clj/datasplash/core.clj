@@ -19,6 +19,7 @@
    (org.apache.beam.sdk Pipeline)
    (org.apache.beam.sdk.coders KvCoder StringUtf8Coder)
    (org.apache.beam.sdk.io Compression FileIO TextIO)
+   (org.apache.beam.sdk.io FileIO$Write$FileNaming)
    (org.apache.beam.sdk.io.fs EmptyMatchTreatment)
    (org.apache.beam.sdk.options PipelineOptionsFactory)
    (org.apache.beam.sdk.transforms Combine
@@ -45,7 +46,7 @@
    (org.apache.beam.sdk.transforms.join CoGbkResult CoGroupByKey KeyedPCollectionTuple)
    (org.apache.beam.sdk.transforms.windowing BoundedWindow FixedWindows Sessions SlidingWindows Trigger Window)
    (org.apache.beam.sdk.util UserCodeException)
-   (org.apache.beam.sdk.values KV PBegin PCollection PCollectionList PCollectionTuple PInput TupleTag TupleTagList)
+   (org.apache.beam.sdk.values KV PBegin PCollection PCollectionList PCollectionTuple PInput TupleTag TupleTagList PCollectionView)
    (org.joda.time DateTimeUtils DateTimeZone Duration Instant)
    (org.joda.time.format DateTimeFormat)))
 
@@ -494,6 +495,10 @@ See https://cloud.google.com/dataflow/java-sdk/JavaDoc/com/google/cloud/dataflow
 
 (declare write-edn-file)
 
+(def ^:dynamic *auto-checkpoint* nil)
+(def ^:dynamic *auto-checkpoint-dir* nil)
+(def ^:dynamic *auto-checkpoint-names* #{})
+
 (defn apply-transform
   "Apply the PTransform to the given Pcoll applying options according to schema."
   [pcoll ^PTransform transform schema
@@ -515,6 +520,27 @@ See https://cloud.google.com/dataflow/java-sdk/JavaDoc/com/google/cloud/dataflow
                     pct)))]
     (when checkpoint
       (write-edn-file checkpoint rcoll))
+    (when (and *auto-checkpoint* (*auto-checkpoint-names* (:name options)))
+      (let [coerce-to-pcoll (fn [pcoll]
+                              (cond
+                                (instance? PCollection pcoll)
+                                pcoll
+                                ;; documented as internal use only...
+                                ;; seem to work in the direct runner at least
+                                ;; which is where we want to use it
+                                ;; Another way would be to create an empty input, and
+                                ;; use map or other transform were we can get side-inputs in.
+                                ;; (we would need to use .getPipeline to get to the start)
+                                (instance? PCollectionView pcoll)
+                                (.getPCollection pcoll)
+
+                                :else nil))
+            in-pcoll (coerce-to-pcoll pcoll)
+            out-pcoll (coerce-to-pcoll rcoll)]
+        (when in-pcoll
+          (write-edn-file (str *auto-checkpoint-dir* "/" nam ".in") {:num-shards 1} in-pcoll))
+        (when out-pcoll
+          (write-edn-file (str *auto-checkpoint-dir* "/" nam ".out") {:num-shards 1} out-pcoll))))
     rcoll))
 
 (defn with-opts-docstr
@@ -552,7 +578,8 @@ See https://cloud.google.com/dataflow/java-sdk/JavaDoc/com/google/cloud/dataflow
                           options (keys enum-map) options-list)
                   {:expected [(keys enum-map)]
                    :given options-list}))))))
-
+(def aaa 5)
+(def bbb 4)
 (def base-schema
   {:coder {:docstr "Uses a specific Coder for the results of this transform. Usually defaults to some form of nippy-coder."}
    :checkpoint {:docstr "Given a path, will store the resulting pcoll at this path in edn to facilitate dev/debug."}})
@@ -1214,6 +1241,12 @@ See https://beam.apache.org/documentation/programming-guide/#creating-a-pipeline
                                                     :inactivity (Watch$Growth/afterTimeSinceNewOutput
                                                                  (->duration termination-duration))
                                                     termination-strategy)))}})
+#_{:clj-kondo/ignore [:unresolved-symbol]}
+(defn file-naming [f]
+  (reify
+    FileIO$Write$FileNaming
+    (getFilename [_this _w _p _n _s _c]
+      (f))))
 
 (def text-writer-schema
   {:file-format {:docstr "Choose file format."
@@ -2221,3 +2254,25 @@ Examples:
   (let [[expressions clauses] (parse-try body)]
     `(try (safe-exec ~@expressions)
           ~@clauses)))
+(import clojure.lang.ILookup)
+(import (org.apache.beam.sdk.values PValue))
+#_(get
+   (->> (make-pipeline [])
+        (generate-input [1 2])
+        (map-kv (fn [x] [x (inc x)]))
+        (view {:type :map})
+        ;; (instance? PValue)
+        )
+   4)
+
+
+#_(let [p (make-pipeline [])
+        vi (->> p
+                (generate-input [1 2 3])
+                (map-kv (fn [x] [x (str x)]))
+                (view {:type :map}))]
+    (->> p
+         (generate-input [1 2 3])
+         (dmap (fn [x] (get vi x)))
+         (write-edn-file "/home/marc/ici")
+         run-pipeline))
