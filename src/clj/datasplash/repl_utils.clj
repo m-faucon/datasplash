@@ -71,14 +71,6 @@
                     (dread f)]))
             files))))
 
-(let [p (ds/make-pipeline [])
-      i (ds/generate-input [1 2 3] p)
-      m {:aa (ds/map inc i)
-         :bb (ds/map dec i)}]
-  (dwrite m "/home/marc/qq")
-  (->> p ds/run-pipeline
-       ds/wait-pipeline-result))
-
 (defmacro direct
   "Inserts pipeline boilerplate.
   This is meant to be used at the repl, or in test namespaces.
